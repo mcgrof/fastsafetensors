@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 from ..common import SafeTensorsMetadata, SingleGroup
 from ..cpp import cpu_free, cpu_malloc, gds_device_buffer
+from ..io_uring_dmabuf import release_dedicated
 from ..st_types import DTYPE_SIZES, Device, DeviceType, DType
 from . import FrameworkOpBase, ProcessGroupBase, TensorBase
 
@@ -332,7 +333,10 @@ class TorchOp(FrameworkOpBase[TorchTensor, TorchProcessGroup]):
     def free_tensor_memory(self, gbuf: gds_device_buffer, dev: Device):
         length = gbuf.get_length()
         if dev.type == DeviceType.CUDA:
-            torch.cuda.caching_allocator_delete(gbuf.get_base_address())
+            # The dmabuf copier allocates registered arena pieces straight from
+            # the runtime; those are not the caching allocator's to free.
+            if not release_dedicated(gbuf.get_base_address()):
+                torch.cuda.caching_allocator_delete(gbuf.get_base_address())
         else:
             cpu_free(gbuf.get_base_address())
         self.mem_used -= length
