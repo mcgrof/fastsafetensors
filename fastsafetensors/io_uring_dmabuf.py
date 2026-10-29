@@ -50,6 +50,7 @@ IORING_RSRC_UPDATE_EXTENDED = 1 << 1
 IO_REGBUF_TYPE_DMABUF = 2
 
 IORING_FEAT_SINGLE_MMAP = 1 << 0
+IORING_REGISTER_IOWQ_MAX_WORKERS = 19
 
 # The kernel maps at most this many bytes per DMA-BUF registration.
 DMABUF_REGISTER_MAX_BYTES = 1 << 30
@@ -252,6 +253,17 @@ class IoUring:
         self._register(
             IORING_REGISTER_BUFFERS_UPDATE, ctypes.byref(up), ctypes.sizeof(up)
         )
+
+    def set_max_workers(self, bounded: int, unbounded: int = 0) -> Tuple[int, int]:
+        """Cap the io-wq worker pools; zero leaves a pool unchanged.
+
+        DMA-BUF reads are punted to bounded io-wq workers, whose default cap
+        is four, so this bounds the number of reads the kernel executes at
+        once. Returns the previous caps.
+        """
+        arr = (ctypes.c_uint * 2)(bounded, unbounded)
+        self._register(IORING_REGISTER_IOWQ_MAX_WORKERS, arr, 2)
+        return int(arr[0]), int(arr[1])
 
     def _take_slot(self) -> int:
         if not self._free_slots:

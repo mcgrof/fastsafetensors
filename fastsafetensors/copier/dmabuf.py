@@ -34,6 +34,8 @@ Environment variables:
 
 - ``FASTSAFETENSORS_DMABUF_IO_BYTES``: bytes per ``READ_FIXED`` (default 16 MiB).
 - ``FASTSAFETENSORS_DMABUF_QUEUE_DEPTH``: reads kept in flight (default 32).
+- ``FASTSAFETENSORS_DMABUF_WORKERS``: io-wq bounded workers executing the
+  reads (default: the kernel's cap of four).
 - ``FASTSAFETENSORS_DMABUF_REGISTER_BYTES``: per-registration cap (default 1 GiB).
 - ``FASTSAFETENSORS_DMABUF_STRICT=1``: fail instead of falling back to the
   ``nogds`` copier when the ring, the export or the file setup is refused.
@@ -81,13 +83,13 @@ _DEFAULT_QUEUE_DEPTH = 32
 _warned_fallback = False
 
 
-def _env_int(name: str, default: int) -> int:
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
     raw = os.environ.get(name)
     if raw is None or raw.strip() == "":
         return default
     value = int(raw)
-    if value <= 0:
-        raise ValueError(f"{name} must be positive, got {value}")
+    if value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}, got {value}")
     return value
 
 
@@ -650,8 +652,12 @@ def new_dmabuf_file_copier(
     register_bytes = _env_int(
         "FASTSAFETENSORS_DMABUF_REGISTER_BYTES", DMABUF_REGISTER_MAX_BYTES
     )
+    # Zero keeps the kernel's own io-wq cap.
+    workers = _env_int("FASTSAFETENSORS_DMABUF_WORKERS", 0, minimum=0)
     try:
         ring = _new_ring(queue_depth)
+        if workers:
+            ring.set_max_workers(workers)
     except OSError as exc:
         return fallback(f"io_uring setup failed: {exc}")
 
