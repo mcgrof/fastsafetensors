@@ -32,10 +32,10 @@ submission path testable without a GPU.
 
 Environment variables:
 
-- ``FASTSAFETENSORS_DMABUF_IO_BYTES``: bytes per ``READ_FIXED`` (default 16 MiB).
-- ``FASTSAFETENSORS_DMABUF_QUEUE_DEPTH``: reads kept in flight (default 32).
+- ``FASTSAFETENSORS_DMABUF_IO_BYTES``: bytes per ``READ_FIXED`` (default 64 MiB).
+- ``FASTSAFETENSORS_DMABUF_QUEUE_DEPTH``: reads kept in flight (default 128).
 - ``FASTSAFETENSORS_DMABUF_WORKERS``: io-wq bounded workers executing the
-  reads (default: the kernel's cap of four).
+  reads (default 32; 0 keeps the kernel's cap of four).
 - ``FASTSAFETENSORS_DMABUF_REGISTER_BYTES``: per-registration cap (default 1 GiB).
 - ``FASTSAFETENSORS_DMABUF_STRICT=1``: fail instead of falling back to the
   ``nogds`` copier when the ring, the export or the file setup is refused.
@@ -78,8 +78,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 ALIGN = 4096
-_DEFAULT_IO_BYTES = 16 << 20
-_DEFAULT_QUEUE_DEPTH = 32
+_DEFAULT_IO_BYTES = 64 << 20
+_DEFAULT_QUEUE_DEPTH = 128
+_DEFAULT_WORKERS = 32
 _warned_fallback = False
 
 
@@ -653,7 +654,7 @@ def new_dmabuf_file_copier(
         "FASTSAFETENSORS_DMABUF_REGISTER_BYTES", DMABUF_REGISTER_MAX_BYTES
     )
     # Zero keeps the kernel's own io-wq cap.
-    workers = _env_int("FASTSAFETENSORS_DMABUF_WORKERS", 0, minimum=0)
+    workers = _env_int("FASTSAFETENSORS_DMABUF_WORKERS", _DEFAULT_WORKERS, minimum=0)
     try:
         ring = _new_ring(queue_depth)
         if workers:

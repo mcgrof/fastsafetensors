@@ -69,8 +69,10 @@ reads never span a slice. When io_uring, the export, the registration or the
 file setup is refused, the copier warns once and falls back to `nogds`;
 `FASTSAFETENSORS_DMABUF_STRICT=1` turns that into an error. On a CPU device the
 same copier registers host memory, which keeps it testable without a GPU.
-`FASTSAFETENSORS_DMABUF_IO_BYTES` (default 16 MiB) sizes each read and
-`FASTSAFETENSORS_DMABUF_QUEUE_DEPTH` (default 32) bounds the reads in flight.
+`FASTSAFETENSORS_DMABUF_IO_BYTES` (default 64 MiB) sizes each read,
+`FASTSAFETENSORS_DMABUF_QUEUE_DEPTH` (default 128) bounds the reads in flight
+and `FASTSAFETENSORS_DMABUF_WORKERS` (default 32) raises the io-wq worker cap
+that executes them; the kernel punts every DMA-BUF read to a worker.
 
 On Linux with libnuma and known GPU NUMA topology, `set_numa=True` places
 nogds workers on the GPU's CPU node and prefers that node for their memory.
