@@ -324,6 +324,8 @@ class SafeTensorsFileLoader(BaseSafeTensorsFileLoader):
         bbuf_size_kb (int): bounce buffer size for file copies.
         max_threads (int): maximum number of threads for memory copies.
         nogds (bool): if True, trun off GDS and fallback to pread with bounce buffer.
+        use_dmabuf (bool): if True, read with io_uring DMA-BUF fixed buffers
+            straight into the device arena (Linux, ext4/XFS/raw NVMe only).
         debug_log (bool): enable debug logs.
 
     Examples:
@@ -346,6 +348,10 @@ class SafeTensorsFileLoader(BaseSafeTensorsFileLoader):
         if copier_type == "fgds":
             out["nogds"] = False
             out["use_fgds"] = True
+        elif copier_type == "dmabuf":
+            out["nogds"] = False
+            out["use_fgds"] = False
+            out["use_dmabuf"] = True
         else:
             out["nogds"] = copier_type != "gds"
             out.setdefault("use_fgds", False)
@@ -363,6 +369,7 @@ class SafeTensorsFileLoader(BaseSafeTensorsFileLoader):
         debug_log: bool = False,
         framework="pytorch",
         use_fgds: bool = False,
+        use_dmabuf: bool = False,
         **kwargs,
     ):
         self.framework = get_framework_op(framework)
@@ -370,7 +377,9 @@ class SafeTensorsFileLoader(BaseSafeTensorsFileLoader):
         self.device = self.framework.get_device(device, self.pg)
 
         fstcpp.set_debug_log(debug_log)
-        if nogds:
+        if use_dmabuf:
+            copier_type = "dmabuf"
+        elif nogds:
             if self.device.type != DeviceType.CPU and is_unified_memory_system(
                 self.framework
             ):

@@ -50,6 +50,28 @@ so a filesystem outside the lists does not fail a load that buffered I/O
 would have completed. Other read failures on an `O_DIRECT` descriptor name
 the flag and the `FASTSAFETENSORS_ODIRECT=0` switch in their error message.
 
+## DMA-BUF copier (io_uring)
+
+`SafeTensorsFileLoader(..., use_dmabuf=True)`, `ParallelLoader(...,
+use_dmabuf=True)` or `copier_type: dmabuf` in the loader config select a
+copier that reads the checkpoint straight into the device arena with
+io_uring. The arena is exported as DMA-BUFs (`hsa_amd_portable_export_dmabuf`
+on ROCm, `cuMemGetHandleForAddressRange` on the NVIDIA open kernel modules),
+each DMA-BUF is registered as an io_uring fixed buffer bound to the
+checkpoint's file descriptor, and `IORING_OP_READ_FIXED` moves the
+4 KiB-aligned superset of the tensor data from the NVMe controller into GPU
+memory. No host memory carries the payload and no device-side copy follows;
+tensors are views into the arena as with the `gds` copier. The path needs a
+kernel with DMA-BUF io_uring fixed buffers, the checkpoint on ext4, XFS or a
+raw block device backed by PCIe NVMe, and `O_DIRECT`. Each DMA-BUF
+registration covers at most 1 GiB, so larger arenas are exported in slices;
+reads never span a slice. When io_uring, the export, the registration or the
+file setup is refused, the copier warns once and falls back to `nogds`;
+`FASTSAFETENSORS_DMABUF_STRICT=1` turns that into an error. On a CPU device the
+same copier registers host memory, which keeps it testable without a GPU.
+`FASTSAFETENSORS_DMABUF_IO_BYTES` (default 16 MiB) sizes each read and
+`FASTSAFETENSORS_DMABUF_QUEUE_DEPTH` (default 32) bounds the reads in flight.
+
 On Linux with libnuma and known GPU NUMA topology, `set_numa=True` places
 nogds workers on the GPU's CPU node and prefers that node for their memory.
 Pinned host buffers are allocated on a separate thread with the same policy,
