@@ -64,6 +64,33 @@ def test_dmabuf_selects_copier(framework, fstcpp_log):
         loader.close()
 
 
+@pytest.mark.parametrize("nogds", [False, True])
+def test_dmabuf_selected_by_environment(framework, fstcpp_log, monkeypatch, nogds):
+    monkeypatch.setenv("FASTSAFETENSORS_USE_DMABUF", "1")
+    loader = SafeTensorsFileLoader(
+        SingleGroup(), "cpu", nogds=nogds, framework=framework.get_name()
+    )
+    try:
+        assert copier_class_of(loader.copier_constructor) is DmabufFileCopier
+    finally:
+        loader.close()
+
+
+def test_environment_does_not_override_fgds(framework, monkeypatch):
+    monkeypatch.setenv("FASTSAFETENSORS_USE_DMABUF", "1")
+    seen = {}
+
+    def capture(self, pg, device, copier_type, *args, **kwargs):
+        seen["copier_type"] = copier_type
+
+    base = SafeTensorsFileLoader.__mro__[1]
+    monkeypatch.setattr(base, "__init__", capture)
+    SafeTensorsFileLoader(
+        SingleGroup(), "cpu", use_fgds=True, framework=framework.get_name()
+    )
+    assert seen["copier_type"] == "fgds"
+
+
 def test_dmabuf_full_file_matches_nogds(framework, input_files, fstcpp_log):
     ref = _reference(framework, input_files[0])
     loader = SafeTensorsFileLoader(
