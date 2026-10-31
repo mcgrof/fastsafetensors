@@ -52,8 +52,15 @@ IO_REGBUF_TYPE_DMABUF = 2
 IORING_FEAT_SINGLE_MMAP = 1 << 0
 IORING_REGISTER_IOWQ_MAX_WORKERS = 19
 
-# The kernel maps at most this many bytes per DMA-BUF registration.
+# Every DMA-BUF io_uring kernel registers at least this many bytes per
+# DMA-BUF; early versions of the series refuse anything larger.
 DMABUF_REGISTER_MAX_BYTES = 1 << 30
+
+# The merged series refuses a DMA-BUF larger than UINT_MAX bytes, because the
+# offset into it travels in a 32-bit bvec field. The ROCm exporter exports the
+# whole driver allocation, which it rounds to 2 MiB, so the largest allocation
+# that stays under the limit is 4 GiB - 2 MiB.
+DMABUF_REGISTER_LARGE_BYTES = (1 << 32) - (2 << 20)
 
 _SQE_SIZE = 64
 _CQE_SIZE = 16
@@ -583,9 +590,9 @@ def release_regions(
 #
 # A caching allocator may hand out a slice of a much larger driver allocation,
 # and the ROCm exporter exports the whole allocation that contains a pointer.
-# The kernel registers at most DMABUF_REGISTER_MAX_BYTES per DMA-BUF, so an
-# arena piece that must be registered needs its own driver allocation of at
-# most that size. These helpers allocate straight from the runtime and record
+# The kernel limits the size of each registered DMA-BUF, so an arena piece
+# that must be registered needs its own driver allocation of at most the
+# copier's registration size. These helpers allocate straight from the runtime and record
 # the pointer so the framework frees it through the runtime as well.
 
 _DEDICATED: Dict[int, Tuple[int, bool]] = {}  # ptr -> (size, is_hip)

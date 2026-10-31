@@ -91,6 +91,86 @@ def test_environment_does_not_override_fgds(framework, monkeypatch):
     assert seen["copier_type"] == "fgds"
 
 
+@pytest.fixture
+def adaptive_cap(monkeypatch):
+    """Scale the caps down (floor 16 KiB, large 1 MiB) and model an early
+    kernel that refuses any registration larger than the floor."""
+    import errno
+
+    floor, large = 16 * 1024, 1 << 20
+    monkeypatch.setattr(dmabuf_mod, "DMABUF_REGISTER_MAX_BYTES", floor)
+    monkeypatch.setattr(dmabuf_mod, "DMABUF_REGISTER_LARGE_BYTES", large)
+    monkeypatch.setattr(dmabuf_mod, "_adaptive_register_bytes", large)
+    monkeypatch.delenv("FASTSAFETENSORS_DMABUF_REGISTER_BYTES", raising=False)
+    monkeypatch.setenv("FASTSAFETENSORS_DMABUF_STRICT", "1")
+    real = dmabuf_mod.register_destination
+    calls = []
+
+    def early_kernel(ring, base, length, target_fd, is_device, is_hip, max_bytes):
+        calls.append(max_bytes)
+        if min(length, max_bytes) > floor:
+            raise OSError(errno.EINVAL, "Invalid argument")
+        return real(ring, base, length, target_fd, is_device, is_hip, max_bytes)
+
+    monkeypatch.setattr(dmabuf_mod, "register_destination", early_kernel)
+    return floor, large, calls
+
+
+def _load_and_compare(framework, path):
+    ref = _reference(framework, path)
+    loader = SafeTensorsFileLoader(
+        SingleGroup(), "cpu", use_dmabuf=True, framework=framework.get_name()
+    )
+    loader.add_filenames({0: [path]})
+    fb = loader.copy_files_to_device()
+    try:
+        assert set(fb.key_to_rank_lidx) == set(ref)
+        for name, expect in ref.items():
+            assert _same(framework, fb, name, expect), name
+    finally:
+        fb.close()
+        loader.close()
+
+
+def test_dmabuf_default_cap_is_large(framework, fstcpp_log, monkeypatch):
+    monkeypatch.delenv("FASTSAFETENSORS_DMABUF_REGISTER_BYTES", raising=False)
+    monkeypatch.setattr(
+        dmabuf_mod, "_adaptive_register_bytes", dmabuf_mod.DMABUF_REGISTER_LARGE_BYTES
+    )
+    loader = SafeTensorsFileLoader(
+        SingleGroup(), "cpu", use_dmabuf=True, framework=framework.get_name()
+    )
+    try:
+        copier = loader.copier_constructor(None, loader.device, loader.framework)
+        assert copier.adaptive_register
+        assert copier.register_bytes == (1 << 32) - (2 << 20)
+    finally:
+        loader.close()
+
+
+def test_dmabuf_refused_large_cap_retries_at_floor(
+    framework, big_file, fstcpp_log, adaptive_cap
+):
+    floor, large, calls = adaptive_cap
+    _load_and_compare(framework, big_file)
+    assert calls[0] == large and calls[-1] == floor
+    assert dmabuf_mod._adaptive_register_bytes == floor
+    # The lower cap holds for later loads: no further large attempt.
+    calls.clear()
+    _load_and_compare(framework, big_file)
+    assert calls and set(calls) == {floor}
+
+
+def test_dmabuf_explicit_cap_is_not_adapted(
+    framework, big_file, fstcpp_log, monkeypatch, adaptive_cap
+):
+    floor, large, _calls = adaptive_cap
+    monkeypatch.setenv("FASTSAFETENSORS_DMABUF_REGISTER_BYTES", str(large))
+    with pytest.raises(RuntimeError, match="dmabuf copier"):
+        _load_and_compare(framework, big_file)
+    assert dmabuf_mod._adaptive_register_bytes == large
+
+
 def test_dmabuf_full_file_matches_nogds(framework, input_files, fstcpp_log):
     ref = _reference(framework, input_files[0])
     loader = SafeTensorsFileLoader(

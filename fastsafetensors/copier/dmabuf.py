@@ -8,15 +8,20 @@ superset of the tensor data. The NVMe controller writes into GPU memory
 directly: no host memory carries the payload and no device-side copy follows,
 because tensors are views into the loaded memory exactly as with ``gds``.
 
-The kernel registers at most ``DMABUF_REGISTER_MAX_BYTES`` (1 GiB) per
-DMA-BUF, and the ROCm exporter exports the whole driver allocation that
-contains a pointer. A shard is therefore loaded into *pieces*: each piece is
-its own runtime allocation of at most the cap, holding whole tensors. A
-tensor larger than the cap gets a piece of its own size; it is read through
-staging allocations of at most the cap and then copied device to device.
-That copy is the only extra traffic the cap costs; a kernel without the cap
-(``FASTSAFETENSORS_DMABUF_REGISTER_BYTES`` raised accordingly) loads every
-shard as one piece.
+The kernel limits the size of each registered DMA-BUF, and the ROCm exporter
+exports the whole driver allocation that contains a pointer. A shard is
+therefore loaded into *pieces*: each piece is its own runtime allocation of
+at most the registration size (the cap), holding whole tensors. A tensor
+larger than the cap gets a piece of its own size; it is read through staging
+allocations of at most the cap and then copied device to device. That copy is
+the only extra traffic the cap costs.
+
+The merged kernel series accepts DMA-BUFs up to 4 GiB, early versions only
+1 GiB. Unless ``FASTSAFETENSORS_DMABUF_REGISTER_BYTES`` sets the cap, the
+copier starts at ``DMABUF_REGISTER_LARGE_BYTES`` (4 GiB - 2 MiB), which loads
+a typical shard as one piece. If the kernel refuses a registration above
+1 GiB, the copier releases the file's pieces, retries it at 1 GiB and keeps
+that cap for the rest of the process.
 
 Requirements:
 
@@ -40,7 +45,8 @@ Environment variables:
 - ``FASTSAFETENSORS_DMABUF_QUEUE_DEPTH``: reads kept in flight (default 128).
 - ``FASTSAFETENSORS_DMABUF_WORKERS``: io-wq bounded workers executing the
   reads (default 32; 0 keeps the kernel's cap of four).
-- ``FASTSAFETENSORS_DMABUF_REGISTER_BYTES``: per-registration cap (default 1 GiB).
+- ``FASTSAFETENSORS_DMABUF_REGISTER_BYTES``: per-registration cap. Unset, it
+  adapts: 4 GiB - 2 MiB, or 1 GiB after the kernel refuses a larger one.
 - ``FASTSAFETENSORS_DMABUF_STRICT=1``: fail instead of falling back to the
   ``nogds`` copier when the ring, the export or the file setup is refused.
 """
@@ -59,6 +65,7 @@ from ..allocation import SharedDeviceAllocation
 from ..common import SafeTensorsMetadata, init_logger, is_gpu_found, is_odirect_enabled
 from ..frameworks import FrameworkOpBase, TensorBase
 from ..io_uring_dmabuf import (
+    DMABUF_REGISTER_LARGE_BYTES,
     DMABUF_REGISTER_MAX_BYTES,
     IoUring,
     RegisteredRegion,
@@ -86,6 +93,9 @@ _DEFAULT_IO_BYTES = 64 << 20
 _DEFAULT_QUEUE_DEPTH = 128
 _DEFAULT_WORKERS = 32
 _warned_fallback = False
+# Adaptive registration cap, shared by every copier in the process; lowered
+# to DMABUF_REGISTER_MAX_BYTES once the kernel refuses a larger DMA-BUF.
+_adaptive_register_bytes = DMABUF_REGISTER_LARGE_BYTES
 
 
 def _env_int(name: str, default: int, minimum: int = 1) -> int:
@@ -112,6 +122,10 @@ def _round_up(x: int) -> int:
 
 class _SetupRefused(Exception):
     """Export, registration or file setup was refused; nogds can still run."""
+
+
+class _RegistrationTooLarge(_SetupRefused):
+    """A registration above 1 GiB was refused; a smaller cap may work."""
 
 
 class _Piece:
@@ -158,7 +172,7 @@ class DmabufFileCopier(CopierInterface):
         framework: FrameworkOpBase,
         io_bytes: int = _DEFAULT_IO_BYTES,
         queue_depth: int = _DEFAULT_QUEUE_DEPTH,
-        register_bytes: int = DMABUF_REGISTER_MAX_BYTES,
+        register_bytes: Optional[int] = None,
         fallback_cache: Optional[List[CopierConstructFunc]] = None,
     ):
         self.framework = framework
@@ -167,6 +181,10 @@ class DmabufFileCopier(CopierInterface):
         self.ring = ring
         self.io_bytes = _round_down(max(io_bytes, ALIGN))
         self.queue_depth = max(1, queue_depth)
+        # None selects the adaptive cap; an explicit size is never changed.
+        self.adaptive_register = register_bytes is None
+        if register_bytes is None:
+            register_bytes = _adaptive_register_bytes
         self.register_bytes = _round_down(max(register_bytes, 2 * ALIGN))
         self.is_device = device.type in (DeviceType.CUDA, DeviceType.GPU)
         self.is_hip = bool(fstcpp.is_hip_found()) if self.is_device else False
@@ -384,6 +402,12 @@ class DmabufFileCopier(CopierInterface):
                 max_bytes=self.register_bytes,
             )
         except (OSError, RuntimeError, ValueError) as exc:
+            if (
+                self.adaptive_register
+                and self.register_bytes > DMABUF_REGISTER_MAX_BYTES
+                and min(length, self.register_bytes) > DMABUF_REGISTER_MAX_BYTES
+            ):
+                raise _RegistrationTooLarge(str(exc)) from exc
             raise _SetupRefused(str(exc)) from exc
 
     def _submit_piece(self, piece: _Piece) -> None:
@@ -413,6 +437,7 @@ class DmabufFileCopier(CopierInterface):
     def submit_io(
         self, use_buf_register: bool, max_copy_block_size: int
     ) -> fstcpp.gds_device_buffer:
+        global _adaptive_register_bytes
         if max_copy_block_size <= 0:
             raise ValueError("max_copy_block_size must be positive")
         if self.is_device and not is_gpu_found():
@@ -451,6 +476,18 @@ class DmabufFileCopier(CopierInterface):
                 self.pieces.append(piece)
                 self._submit_piece(piece)
             self.ring.submit()
+        except _RegistrationTooLarge as exc:
+            self._abort()
+            _adaptive_register_bytes = DMABUF_REGISTER_MAX_BYTES
+            logger.warning(
+                "dmabuf copier: kernel refused a %d byte registration (%s); "
+                "using %d byte registrations from now on",
+                self.register_bytes,
+                exc,
+                DMABUF_REGISTER_MAX_BYTES,
+            )
+            self.register_bytes = DMABUF_REGISTER_MAX_BYTES
+            return self.submit_io(use_buf_register, max_copy_block_size)
         except _SetupRefused as exc:
             self._abort()
             return self._use_fallback(str(exc)).submit_io(
@@ -654,9 +691,10 @@ def new_dmabuf_file_copier(
         return fallback("GPU runtime library not found")
     io_bytes = _env_int("FASTSAFETENSORS_DMABUF_IO_BYTES", _DEFAULT_IO_BYTES)
     queue_depth = _env_int("FASTSAFETENSORS_DMABUF_QUEUE_DEPTH", _DEFAULT_QUEUE_DEPTH)
-    register_bytes = _env_int(
-        "FASTSAFETENSORS_DMABUF_REGISTER_BYTES", DMABUF_REGISTER_MAX_BYTES
-    )
+    # None keeps the adaptive cap (see the module docstring).
+    register_bytes: Optional[int] = None
+    if os.environ.get("FASTSAFETENSORS_DMABUF_REGISTER_BYTES", "").strip():
+        register_bytes = _env_int("FASTSAFETENSORS_DMABUF_REGISTER_BYTES", 0)
     # Zero keeps the kernel's own io-wq cap.
     workers = _env_int("FASTSAFETENSORS_DMABUF_WORKERS", _DEFAULT_WORKERS, minimum=0)
     try:
