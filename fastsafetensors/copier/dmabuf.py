@@ -40,6 +40,10 @@ submission path testable without a GPU.
 
 Environment variables:
 
+- ``FASTSAFETENSORS_USE_DMABUF=1``: select this copier for a caller that
+  passes neither ``use_dmabuf`` nor ``use_fgds`` (vLLM's
+  ``--load-format fastsafetensors``, for example), in place of its ``nogds``
+  choice.
 - ``FASTSAFETENSORS_DMABUF_IO_BYTES``: bytes per ``READ_FIXED`` (default 64 MiB).
 - ``FASTSAFETENSORS_DMABUF_QUEUE_DEPTH``: reads kept in flight (default 128).
 - ``FASTSAFETENSORS_DMABUF_REGISTER_BYTES``: per-registration cap. Unset, it

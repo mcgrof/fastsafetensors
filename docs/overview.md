@@ -100,6 +100,11 @@ memory, which keeps it testable without a GPU.
 `FASTSAFETENSORS_DMABUF_IO_BYTES` (default 64 MiB) sizes each read and
 `FASTSAFETENSORS_DMABUF_QUEUE_DEPTH` (default 128) bounds the reads in flight.
 
+Engines that build the loader with only a `nogds` choice, such as vLLM's
+`--load-format fastsafetensors`, can select this copier with
+`FASTSAFETENSORS_USE_DMABUF=1`. It applies when the caller passes neither
+`use_dmabuf` nor `use_fgds`, and replaces the caller's `nogds` choice.
+
 On Linux with libnuma and known GPU NUMA topology, `set_numa=True` places
 nogds workers on the GPU's CPU node and prefers that node for their memory.
 Pinned host buffers are allocated on a separate thread with the same policy,

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 import platform
 from typing import (
     Any,
@@ -327,6 +328,9 @@ class SafeTensorsFileLoader(BaseSafeTensorsFileLoader):
         use_dmabuf (bool): if True, read with io_uring DMA-BUF fixed buffers
             straight into device memory (Linux; see docs/overview.md for the
             kernel, file system and GPU requirements).
+            ``FASTSAFETENSORS_USE_DMABUF=1`` selects it for a caller that
+            passes neither ``use_dmabuf`` nor ``use_fgds``, and takes the
+            place of that caller's ``nogds`` choice.
         debug_log (bool): enable debug logs.
 
     Examples:
@@ -378,6 +382,11 @@ class SafeTensorsFileLoader(BaseSafeTensorsFileLoader):
         self.device = self.framework.get_device(device, self.pg)
 
         fstcpp.set_debug_log(debug_log)
+        # Engines such as vLLM construct the loader with only ``nogds``; the
+        # variable lets an operator pick the dmabuf copier without changing
+        # the engine.
+        if not use_dmabuf and not use_fgds:
+            use_dmabuf = os.environ.get("FASTSAFETENSORS_USE_DMABUF", "0") == "1"
         if use_dmabuf:
             copier_type = "dmabuf"
         elif nogds:
