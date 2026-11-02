@@ -906,6 +906,7 @@ class ParallelLoader(PipelineParallel):
         accumulate_resident: bool = True,
         resident_tensor: Optional[Callable[[str], bool]] = None,
         use_fgds: bool = False,
+        use_dmabuf: bool = False,
         broadcast_run_bytes: int = 16 << 20,
         broadcast_run_tensors: int = 64,
         overlap_io: bool = True,
@@ -928,6 +929,8 @@ class ParallelLoader(PipelineParallel):
             debug_log (bool): Enable debug logs.
             framework (str): Framework to use for tensor operations.
             use_fgds (bool): If True, use FGDS instead of cuFile GDS.
+            use_dmabuf (bool): If True, use io_uring DMA-BUF reads into the
+                device arena instead of cuFile GDS.
         """
         # all_local: load with a single-process group so each rank reads its
         # files independently (no cross-rank broadcast in get_tensor). This is
@@ -945,6 +948,7 @@ class ParallelLoader(PipelineParallel):
             debug_log=debug_log,
             framework=framework,
             use_fgds=use_fgds,
+            use_dmabuf=use_dmabuf,
             device_memory_budget=device_memory_budget,
             **kwargs,
         )

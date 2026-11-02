@@ -50,6 +50,56 @@ so a filesystem outside the lists does not fail a load that buffered I/O
 would have completed. Other read failures on an `O_DIRECT` descriptor name
 the flag and the `FASTSAFETENSORS_ODIRECT=0` switch in their error message.
 
+## DMA-BUF copier (io_uring)
+
+The DMA-BUF copier reads a checkpoint from NVMe straight into GPU memory
+without a host bounce buffer and without cuFile. It allocates the device
+memory for a shard, exports it as a DMA-BUF (the Linux handle for sharing a
+device buffer between drivers), registers that DMA-BUF with io_uring as a
+fixed buffer bound to the checkpoint's file descriptor, and issues
+`IORING_OP_READ_FIXED` for the 4 KiB-aligned superset of the tensor data. The
+NVMe controller then writes into GPU memory directly, and tensors are views
+into that memory as with the `gds` copier. Compared with `nogds`, which reads
+into pinned host memory and then copies to the GPU, no payload byte crosses
+host memory.
+
+Select it with `SafeTensorsFileLoader(..., use_dmabuf=True)`,
+`ParallelLoader(..., use_dmabuf=True)` or `copier_type: dmabuf` in the loader
+config.
+
+It needs:
+
+- a kernel with io_uring DMA-BUF registered buffers, the series queued for
+  Linux 7.4. That series supports raw block devices on PCIe NVMe. Reading
+  XFS files also needs the
+  [XFS RFC](https://lore.kernel.org/all/20261016091919.971295-1-anuj1072538@gmail.com/).
+  ext4 support is only in the
+  [2026-10-30-dmabuf-on-axboe-for-7.4](https://git.kernel.org/pub/scm/linux/kernel/git/mcgrof/linux.git/log/?h=2026-10-30-dmabuf-on-axboe-for-7.4)
+  test branch, which has the series, the XFS RFC, ext4 support and other
+  DMA-BUF patches. The file must accept `O_DIRECT`;
+- a GPU whose driver can export device memory as a DMA-BUF:
+  `hsa_amd_portable_export_dmabuf` on ROCm, or `cuMemGetHandleForAddressRange`
+  on an NVIDIA GPU that reports `CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED`, which
+  data-center GPUs with the open kernel modules do and GeForce GPUs do not.
+
+The kernel limits the size of each registered DMA-BUF, and the ROCm exporter
+exports the whole driver allocation that contains a pointer, so a shard is
+loaded into pieces, each its own runtime allocation of at most the
+registration size. The copier starts at 4 GiB - 2 MiB, which loads a typical
+shard as one piece; if the kernel refuses a registration above 1 GiB, as early
+revisions of the series did, it retries at 1 GiB and keeps that size for the
+rest of the process. `FASTSAFETENSORS_DMABUF_REGISTER_BYTES` sets a fixed size
+instead. A tensor larger than the registration size is read through staging
+allocations and copied device to device, the only device-side copy this path
+makes.
+
+When io_uring, the export, the registration or the file setup is refused, the
+copier warns once and falls back to `nogds`; `FASTSAFETENSORS_DMABUF_STRICT=1`
+turns that into an error. On a CPU device the same copier registers host
+memory, which keeps it testable without a GPU.
+`FASTSAFETENSORS_DMABUF_IO_BYTES` (default 64 MiB) sizes each read and
+`FASTSAFETENSORS_DMABUF_QUEUE_DEPTH` (default 128) bounds the reads in flight.
+
 On Linux with libnuma and known GPU NUMA topology, `set_numa=True` places
 nogds workers on the GPU's CPU node and prefers that node for their memory.
 Pinned host buffers are allocated on a separate thread with the same policy,
