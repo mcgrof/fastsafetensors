@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from ..common import SingleGroup
 from ..cpp import cpu_free, cpu_malloc, gds_device_buffer, gpu_free, gpu_malloc
+from ..io_uring_dmabuf import release_dedicated
 from ..st_types import Device, DeviceType, DType
 from . import FrameworkOpBase, ProcessGroupBase, TensorBase
 
@@ -241,7 +242,10 @@ class PaddleOp(FrameworkOpBase[PaddleTensor, PaddleProcessGroup]):
     def free_tensor_memory(self, gbuf: gds_device_buffer, dev: Device) -> None:
         length = gbuf.get_length()
         if dev.type == DeviceType.GPU:
-            gpu_free(gbuf.get_base_address())
+            # The dmabuf copier allocates registered pieces straight from the
+            # runtime and records them; free those through the same record.
+            if not release_dedicated(gbuf.get_base_address()):
+                gpu_free(gbuf.get_base_address())
         else:
             cpu_free(gbuf.get_base_address())
         self.mem_used -= length

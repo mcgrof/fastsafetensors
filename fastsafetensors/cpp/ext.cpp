@@ -523,6 +523,23 @@ bool is_cuda_found()
     return gpu_found && !is_hip_runtime;
 }
 
+#ifndef _MSC_VER
+// io_uring rings are memory shared with the kernel. Reading a completion
+// needs an acquire load of the completion tail, and returning completion
+// slots or publishing a submission needs a release store; plain Python loads
+// and stores do not give those orderings on weakly ordered CPUs such as
+// arm64. io_uring_dmabuf.py reads and writes the ring indices through these.
+uint32_t ring_load_acquire(uintptr_t addr)
+{
+    return __atomic_load_n(reinterpret_cast<uint32_t*>(addr), __ATOMIC_ACQUIRE);
+}
+
+void ring_store_release(uintptr_t addr, uint32_t value)
+{
+    __atomic_store_n(reinterpret_cast<uint32_t*>(addr), value, __ATOMIC_RELEASE);
+}
+#endif
+
 bool is_hip_found()
 {
     return gpu_found && is_hip_runtime;
@@ -1733,6 +1750,10 @@ PYBIND11_MODULE(__MOD_NAME__, m)
     init_gil_release_from_env();
     m.def("is_cuda_found", &is_cuda_found);
     m.def("is_hip_found", &is_hip_found);
+#ifndef _MSC_VER
+    m.def("ring_load_acquire", &ring_load_acquire);
+    m.def("ring_store_release", &ring_store_release);
+#endif
     m.def("is_cufile_found", &is_cufile_found);
     m.def("cufile_version", &cufile_version);
     m.def("set_debug_log", &set_debug_log);

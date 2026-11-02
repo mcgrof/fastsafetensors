@@ -136,6 +136,10 @@ K = TypeVar("K", bound=ProcessGroupBase)
 
 
 class FrameworkOpBase(ABC, Generic[T, K]):
+    # Bytes of device or host memory this framework instance has allocated
+    # for loads and not yet freed; reported by get_mem_used().
+    mem_used: int
+
     def broadcast_contiguous_run(
         self,
         pg: K,
