@@ -419,3 +419,104 @@ def test_dmabuf_many_reads_wrap_the_ring(framework, big_file, monkeypatch, fstcp
     finally:
         fb.close()
         loader.close()
+
+
+def _pad_header(path, data_mod):
+    """Pad the header with spaces so tensor data starts at ``data_mod``
+    modulo 4 KiB, as a file with an unpadded header would."""
+    import struct
+
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        header = f.read(n)
+        body = f.read()
+    pad = (data_mod - 8 - n) % 4096
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", n + pad) + header + b" " * pad + body)
+
+
+@pytest.fixture
+def misaligned_file(tmp_dir):
+    """Tensor data at byte 280 modulo 4 KiB (8 modulo 16), with tensors at
+    page, 16-byte and odd offsets inside the data section and one tensor
+    above a 16 KiB registration cap."""
+    import torch
+    from safetensors.torch import save_file
+
+    torch.manual_seed(11)
+    tensors = {
+        "a.page": torch.randn(4096 // 2, dtype=torch.bfloat16),
+        "b.big": torch.randn(40 * 1024 // 2, dtype=torch.bfloat16),
+        "c.odd": torch.randint(0, 255, (9,), dtype=torch.uint8),
+        "d.after_odd": torch.randn(3 * 1024 // 4, dtype=torch.float32),
+        "e.empty": torch.empty(0, dtype=torch.bfloat16),
+        "f.tail": torch.randn(1000 // 2, dtype=torch.bfloat16),
+    }
+    path = os.path.join(tmp_dir, "misaligned.safetensors")
+    save_file(tensors, path)
+    _pad_header(path, 280)
+    return path
+
+
+@pytest.mark.parametrize("cap_kib", [None, 16])
+@pytest.mark.parametrize("align", [None, 4096])
+def test_dmabuf_aligns_tensor_data(
+    framework, misaligned_file, monkeypatch, fstcpp_log, cap_kib, align
+):
+    """Tensor data that starts off the alignment is moved onto it, in one
+    piece or several, and every value still matches the nogds reader."""
+    from fastsafetensors.common import SafeTensorsMetadata
+
+    if cap_kib is not None:
+        monkeypatch.setenv("FASTSAFETENSORS_DMABUF_REGISTER_BYTES", str(cap_kib << 10))
+        monkeypatch.setenv("FASTSAFETENSORS_DMABUF_IO_BYTES", str(8 * 1024))
+    if align is not None:
+        monkeypatch.setenv("FASTSAFETENSORS_DMABUF_ALIGN", str(align))
+    want = align or framework.get_device_ptr_align()
+    meta = SafeTensorsMetadata.from_file(misaligned_file, framework)
+    assert meta.header_length % 4096 == 280
+    ref = _reference(framework, misaligned_file)
+    loader, fb = _load_all(framework, misaligned_file)
+    try:
+        assert set(fb.key_to_rank_lidx) == set(ref)
+        checked = 0
+        for name, expect in ref.items():
+            assert _same(framework, fb, name, expect), name
+            off = meta.tensors[name].data_offsets[0]
+            if expect.numel() == 0:
+                continue
+            ptr = fb.get_tensor(name).data_ptr()
+            assert ptr % want == off % want, (name, ptr % want, off % want)
+            checked += 1
+        assert checked == len(ref) - 1
+    finally:
+        fb.close()
+        loader.close()
+
+
+def test_dmabuf_align_one_keeps_file_offsets(
+    framework, misaligned_file, monkeypatch, fstcpp_log
+):
+    """An alignment of 1 moves nothing: data stays at the file's offsets
+    modulo 4 KiB, as the reads placed it."""
+    from fastsafetensors.common import SafeTensorsMetadata
+
+    monkeypatch.setenv("FASTSAFETENSORS_DMABUF_ALIGN", "1")
+    meta = SafeTensorsMetadata.from_file(misaligned_file, framework)
+    loader, fb = _load_all(framework, misaligned_file)
+    try:
+        ptr = fb.get_tensor("a.page").data_ptr()
+        start = meta.header_length + meta.tensors["a.page"].data_offsets[0]
+        assert ptr % 4096 == start % 4096
+    finally:
+        fb.close()
+        loader.close()
+
+
+@pytest.mark.parametrize("value", ["3", "8192", "0"])
+def test_dmabuf_align_rejects_bad_values(framework, monkeypatch, value):
+    monkeypatch.setenv("FASTSAFETENSORS_DMABUF_ALIGN", value)
+    with pytest.raises(ValueError):
+        SafeTensorsFileLoader(
+            SingleGroup(), "cpu", use_dmabuf=True, framework=framework.get_name()
+        )

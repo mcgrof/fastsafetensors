@@ -50,6 +50,24 @@ Environment variables:
   adapts: 4 GiB - 2 MiB, or 1 GiB after the kernel refuses a larger one.
 - ``FASTSAFETENSORS_DMABUF_STRICT=1``: fail instead of falling back to the
   ``nogds`` copier when the ring, the export or the file setup is refused.
+- ``FASTSAFETENSORS_DMABUF_ALIGN``: alignment in bytes, a power of two up to
+  4096, for the start of the tensor data (default: the framework's device
+  pointer alignment, 16 bytes with PyTorch). See below.
+
+Alignment: O_DIRECT and NVMe DMA need the file offset and the destination
+address of each read to be 4 KiB aligned, so the reads place file offset
+``x`` at a device address congruent to ``x`` modulo 4 KiB. Tensor data then
+starts at ``header_length`` modulo 4 KiB, which for most files is not even
+16-byte aligned. Unless ``wait_io`` is called with ``noalign=True``, the
+copier then moves each piece's bytes inside its own allocation, after the
+reads complete, so that the first byte of the tensor data lands on the
+chosen alignment; each tensor is then aligned as its offset in the data
+section allows. The ``gds`` copier makes the same move to the device
+pointer alignment. Kernels that use the tensors in place can need more:
+a fused mixture-of-experts Triton kernel ran 8% to 32% slower on weights
+that were 16-byte aligned but not 4 KiB aligned, so such callers can set
+4096. A file whose header is padded so that the data starts at a multiple
+of the alignment needs no move.
 """
 
 from __future__ import annotations
@@ -75,6 +93,7 @@ from ..io_uring_dmabuf import (
     device_memcpy,
     device_scope,
     register_destination,
+    release_dedicated,
     release_regions,
 )
 from ..st_types import Device, DeviceType, DType
@@ -94,6 +113,8 @@ logger = init_logger(__name__)
 ALIGN = 4096
 _DEFAULT_IO_BYTES = 64 << 20
 _DEFAULT_QUEUE_DEPTH = 128
+# Largest temporary buffer for the alignment move (see _move).
+_MOVE_CHUNK_BYTES = 64 << 20
 _warned_fallback = False
 # Adaptive registration cap, shared by every copier in the process; lowered
 # to DMABUF_REGISTER_MAX_BYTES once the kernel refuses a larger DMA-BUF.
@@ -112,6 +133,13 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
 
 def strict_mode() -> bool:
     return os.environ.get("FASTSAFETENSORS_DMABUF_STRICT", "0") == "1"
+
+
+def _check_align(align: int) -> None:
+    if align < 1 or align > ALIGN or align & (align - 1):
+        raise ValueError(
+            f"dmabuf alignment must be a power of two from 1 to {ALIGN}, got {align}"
+        )
 
 
 def _round_down(x: int) -> int:
@@ -141,6 +169,7 @@ class _Piece:
         "gbuf",
         "pad",
         "regions",
+        "shift",
         "staging",
     )
 
@@ -151,6 +180,8 @@ class _Piece:
         self.oversize = False
         self.gbuf: Optional[fstcpp.gds_device_buffer] = None
         self.pad = 0  # bytes between the allocation base and the I/O start
+        # bytes the alignment move displaced the data by (negative: down)
+        self.shift = 0
         self.regions: List[RegisteredRegion] = []
         # (gbuf, pad, file_off, length, regions) staging buffers of an
         # oversize piece; copied into gbuf after completion
@@ -176,6 +207,7 @@ class DmabufFileCopier(CopierInterface):
         queue_depth: int = _DEFAULT_QUEUE_DEPTH,
         register_bytes: Optional[int] = None,
         fallback_cache: Optional[List[CopierConstructFunc]] = None,
+        align: Optional[int] = None,
     ):
         self.framework = framework
         self.metadata = metadata
@@ -199,6 +231,11 @@ class DmabufFileCopier(CopierInterface):
         self._fallback: Optional[CopierInterface] = None
         self._fallback_cache = fallback_cache
         self.staging_copy_bytes = 0
+        if align is None:
+            align = framework.get_device_ptr_align()
+        _check_align(align)
+        self.align = align
+        self.align_move_bytes = 0
 
     # -- range selection ----------------------------------------------------
 
@@ -612,6 +649,67 @@ class DmabufFileCopier(CopierInterface):
                 self._free(sbuf)
             piece.staging.clear()
 
+    # -- alignment ----------------------------------------------------------
+
+    def _move(self, dst: int, src: int, n: int) -> None:
+        """Copy ``n`` bytes from ``src`` to ``dst``; the ranges may overlap.
+
+        A device-to-device copy between overlapping ranges is undefined, so
+        the bytes go through a temporary buffer, chunk by chunk, in the
+        order that never reads a byte already overwritten.
+        """
+        if not self.is_device:
+            ctypes.memmove(dst, src, n)
+            return
+        chunk = min(n, _MOVE_CHUNK_BYTES)
+        with self._on_device():
+            tmp = dedicated_malloc(chunk, self.is_hip)
+            try:
+                offsets = range(0, n, chunk)
+                for off in reversed(offsets) if dst > src else offsets:
+                    length = min(chunk, n - off)
+                    device_memcpy(tmp, src + off, length, self.is_hip)
+                    device_memcpy(dst + off, tmp, length, self.is_hip)
+            finally:
+                release_dedicated(tmp)
+
+    def _align_pieces(self, pieces: List[_Piece]) -> None:
+        """Move each piece's tensor bytes so the data section is aligned.
+
+        The reads put file offset ``x`` at an address congruent to ``x``
+        modulo 4 KiB (see the module docstring). Displacing a piece's bytes
+        by ``shift``, with ``header_length + shift`` a multiple of
+        ``self.align``, puts every tensor at an address congruent to its
+        offset in the data section. The move goes down when the bytes below
+        the first tensor allow it and up otherwise. Every allocation has a
+        page more than the span it reads, so one of the two always fits.
+        """
+        miss = self.metadata.header_length % self.align
+        if miss == 0:
+            return
+        header_length = self.metadata.header_length
+        for piece in pieces:
+            used = [
+                (header_length + f.data_offsets[0], header_length + f.data_offsets[1])
+                for name, f in self.metadata.tensors.items()
+                if name in piece.names and f.data_offsets[0] < f.data_offsets[1]
+            ]
+            if not used or piece.gbuf is None:
+                continue
+            lo = min(a for a, _ in used)
+            hi = max(b for _, b in used)
+            base = piece.gbuf.get_base_address()
+            end = base + piece.gbuf.get_length()
+            src = piece.dest() + (lo - piece.file_lo)
+            if src - miss >= base:
+                shift = -miss
+            else:
+                shift = self.align - miss
+                assert src + (hi - lo) + shift <= end, "no room to align"
+            self._move(src + shift, src, hi - lo)
+            piece.shift = shift
+            self.align_move_bytes += hi - lo
+
     def wait_io(
         self,
         gbuf: fstcpp.gds_device_buffer,
@@ -643,6 +741,15 @@ class DmabufFileCopier(CopierInterface):
                 f"{self.metadata.src} needs {len(pieces)} pieces under the "
                 f"{self.register_bytes} byte registration cap"
             )
+        if not noalign:
+            try:
+                self._align_pieces(pieces)
+            except BaseException:
+                # The factory owns the first piece; free the others here.
+                for piece in extras:
+                    assert piece.gbuf is not None
+                    self._free(piece.gbuf)
+                raise
         tensors: Dict[str, TensorBase] = {}
         for index, piece in enumerate(pieces):
             piece_buf = piece.gbuf
@@ -657,7 +764,7 @@ class DmabufFileCopier(CopierInterface):
                     self.metadata._get_tensors(
                         piece_buf,
                         self.device,
-                        piece.file_lo - piece.pad,
+                        piece.file_lo - piece.pad - piece.shift,
                         dtype=dtype,
                         names=piece.names,
                         owner=owner if extra_owner is None else extra_owner,
@@ -714,6 +821,11 @@ def new_dmabuf_file_copier(
     register_bytes: Optional[int] = None
     if os.environ.get("FASTSAFETENSORS_DMABUF_REGISTER_BYTES", "").strip():
         register_bytes = _env_int("FASTSAFETENSORS_DMABUF_REGISTER_BYTES", 0)
+    # None keeps the framework's device pointer alignment.
+    align: Optional[int] = None
+    if os.environ.get("FASTSAFETENSORS_DMABUF_ALIGN", "").strip():
+        align = _env_int("FASTSAFETENSORS_DMABUF_ALIGN", 0)
+        _check_align(align)
     try:
         ring = _new_ring(queue_depth)
     except OSError as exc:
@@ -733,6 +845,7 @@ def new_dmabuf_file_copier(
             queue_depth=queue_depth,
             register_bytes=register_bytes,
             fallback_cache=fallback_cache,
+            align=align,
         )
 
     # Keep the ring alive as long as the constructor is referenced by the loader.
