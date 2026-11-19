@@ -479,7 +479,7 @@ def export_device_range(ptr: int, size: int, is_hip: bool) -> Tuple[int, int, in
             f"DMA-BUF export needs a page-aligned range, got {ptr:#x}+{size}"
         )
     if is_hip:
-        lib = ctypes.CDLL("libhsa-runtime64.so.1")
+        lib = _shared_lib("libhsa-runtime64.so.1")
         fn = lib.hsa_amd_portable_export_dmabuf
         fn.argtypes = [
             ctypes.c_void_p,
@@ -619,10 +619,22 @@ def release_regions(
 # is the context the CUDA runtime, and therefore PyTorch, uses.
 
 
+@functools.lru_cache(maxsize=None)
+def _shared_lib(name: str) -> ctypes.CDLL:
+    """Open a runtime library once per process.
+
+    Each ``ctypes.CDLL`` object builds its own function-pointer class and
+    sits in a reference cycle, so opening the library on every call leaves
+    garbage that only the cycle collector frees: four objects of this kind
+    per loaded file.
+    """
+    return ctypes.CDLL(name)
+
+
 def _runtime(is_hip: bool):
     """The HIP runtime. NVIDIA goes through ``_cuda_driver`` instead."""
     assert is_hip, "the CUDA path uses the driver API"
-    return ctypes.CDLL("libamdhip64.so")
+    return _shared_lib("libamdhip64.so")
 
 
 _CUDA_DRIVER_LIB = "libcuda.so.1"
