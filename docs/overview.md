@@ -105,6 +105,61 @@ Engines that build the loader with only a `nogds` choice, such as vLLM's
 `FASTSAFETENSORS_USE_DMABUF=1`. It applies when the caller passes neither
 `use_dmabuf` nor `use_fgds`, and replaces the caller's `nogds` choice.
 
+### Where the loaded tensors start
+
+O_DIRECT and NVMe DMA need the file offset and the destination address of
+each read to agree modulo 4 KiB, so the copier places file byte `x` at a
+device address congruent to `x` modulo 4096. Each tensor therefore sits at
+the same position within a page as in the file. The safetensors library
+pads the header to a multiple of 8 bytes, so the data is 8-byte aligned, as
+it is when the file is mapped with mmap, but for many checkpoints it starts
+at, for example, byte 280 of a page, which is not 16-byte aligned. The
+`nogds` copier instead copies the data section to the start of its own
+allocation, and the `gds` copier moves it to 16 bytes.
+
+The dmabuf copier moves nothing by default, because the right alignment
+depends on what the caller does with the tensors:
+
+| Caller | Setting | Why |
+|---|---|---|
+| An engine that copies each tensor into its own parameters: vLLM's `--load-format fastsafetensors`, and other engines that load through `load_weights` | default (no move) | The engine's parameters are fresh, aligned allocations; the source alignment does not matter, and a move only adds a device copy |
+| A loader that computes on the loaded tensors in place, such as a mixture-of-experts (MoE) server that swaps expert weights without a second copy | data section packed at 4096 bytes; otherwise `align=4096` | Fused kernels can run much slower on data that is not page-aligned |
+| A caller that needs the `gds` contract | `FASTSAFETENSORS_DMABUF_ALIGN=16` | Same placement as the `gds` copier |
+
+Measured on a Radeon Pro W7900 with a 25.3 GiB BF16 checkpoint (11 shards,
+four with data at 8 modulo 16), loaded the way vLLM loads it
+(`ParallelLoader`, copy into preallocated parameters, cold page cache,
+medians of three loads in each of two runs):
+
+| Alignment | nogds | dmabuf | dmabuf - nogds |
+|---|---|---|---|
+| 1, the default | 4.013 / 4.076 s | 3.942 / 3.966 s | -71 / -110 ms |
+| 16 | 3.990 / 4.044 s | 3.995 / 4.049 s | +5 / +5 ms |
+| 4096 | 4.004 / 4.012 s | 4.171 / 4.134 s | +167 / +122 ms |
+
+And a fused MoE Triton kernel at 1,024 tokens on a 384 MiB expert layer
+used in place after the load:
+
+| Data section starts at | Alignment | Bytes moved | Kernel time |
+|---|---|---|---|
+| byte 280 of a page | 1 | 0 | 4.81 ms |
+| byte 280 of a page | 16 | 384 MiB | 3.11 ms |
+| byte 280 of a page | 4096 | 384 MiB | 2.26 ms |
+| byte 0 of a page (packed) | any | 0 | 2.25-2.26 ms |
+| (a fresh copy of the same weights) | | | 2.26-2.27 ms |
+
+So 16 bytes recovers only part of the kernel slowdown, while a page-aligned
+data section matches a fresh allocation. The cheapest page-aligned layout
+is a file written with its header padded so that the data section starts at
+a multiple of 4096: then nothing moves at any setting. A caller that uses
+tensors in place should still ask for 4096, so that a file that is not
+padded is moved (about 6 ms per GB) rather than silently used slowly.
+
+Set the alignment with `FASTSAFETENSORS_DMABUF_ALIGN` (a power of two from
+1 to 4096) for every copier in the process, or per copier with
+`DmabufFileCopier.set_align(4096)` before `wait_io`. `wait_io(noalign=True)`
+skips the move whatever the setting.
+
 On Linux with libnuma and known GPU NUMA topology, `set_numa=True` places
 nogds workers on the GPU's CPU node and prefers that node for their memory.
 Pinned host buffers are allocated on a separate thread with the same policy,

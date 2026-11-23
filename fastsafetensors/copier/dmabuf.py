@@ -51,23 +51,42 @@ Environment variables:
 - ``FASTSAFETENSORS_DMABUF_STRICT=1``: fail instead of falling back to the
   ``nogds`` copier when the ring, the export or the file setup is refused.
 - ``FASTSAFETENSORS_DMABUF_ALIGN``: alignment in bytes, a power of two up to
-  4096, for the start of the tensor data (default: the framework's device
-  pointer alignment, 16 bytes with PyTorch). See below.
+  4096, for the start of the tensor data. Default 1: no move. See below.
 
-Alignment: O_DIRECT and NVMe DMA need the file offset and the destination
+Alignment. O_DIRECT and NVMe DMA need the file offset and the destination
 address of each read to be 4 KiB aligned, so the reads place file offset
-``x`` at a device address congruent to ``x`` modulo 4 KiB. Tensor data then
-starts at ``header_length`` modulo 4 KiB, which for most files is not even
-16-byte aligned. Unless ``wait_io`` is called with ``noalign=True``, the
-copier then moves each piece's bytes inside its own allocation, after the
-reads complete, so that the first byte of the tensor data lands on the
-chosen alignment; each tensor is then aligned as its offset in the data
-section allows. The ``gds`` copier makes the same move to the device
-pointer alignment. Kernels that use the tensors in place can need more:
-a fused mixture-of-experts Triton kernel ran 8% to 32% slower on weights
-that were 16-byte aligned but not 4 KiB aligned, so such callers can set
-4096. A file whose header is padded so that the data starts at a multiple
-of the alignment needs no move.
+``x`` at a device address congruent to ``x`` modulo 4 KiB. The tensor data
+therefore starts at ``header_length`` modulo 4 KiB, the same position it has
+in the file. The safetensors library pads the header to a multiple of 8
+bytes, so the data is 8-byte aligned, as it is when the file is mapped with
+mmap, but often not 16-byte aligned.
+
+What the caller does with the tensors decides whether that matters:
+
+- A caller that copies each tensor into storage of its own (vLLM's weight
+  loaders, and any engine that loads through ``load_weights``) gains nothing
+  from a better-aligned source. The default therefore moves nothing. On a
+  25 GiB checkpoint loaded the way vLLM loads it, the copier took 3.94-3.97 s
+  with no move, 3.99-4.05 s with a 16-byte move and 4.13-4.17 s with a
+  4096-byte move, against 3.99-4.08 s for ``nogds``.
+- A caller that computes on the loaded tensors in place (a mixture-of-experts
+  loader that swaps expert weights without a second copy) can need a
+  page-aligned data section. On a Radeon Pro W7900 a fused MoE Triton kernel
+  ran at 4.81 ms on data at byte 280 of a page, 3.11 ms after a 16-byte move
+  and 2.26 ms after a 4096-byte move, the same as on a fresh allocation.
+  Such a caller should load files whose data section already starts on a
+  4096-byte boundary (pad the header when writing them; then nothing moves),
+  or ask for ``align=4096`` (``set_align``, the constructor or the
+  environment variable) so that a file that is not padded is moved instead
+  of silently running slower.
+
+When an alignment above 1 is set and the data section is not on it, the
+copier moves each piece's bytes inside its own allocation after the reads
+complete, so the first byte of the tensor data lands on the alignment; each
+tensor is then aligned as its offset in the data section allows. The move
+costs about 6 ms per GB on that GPU. ``wait_io(noalign=True)`` skips the move
+whatever the setting. The ``gds`` copier, by contrast, always moves to the
+device pointer alignment (16 bytes with PyTorch).
 """
 
 from __future__ import annotations
@@ -231,8 +250,9 @@ class DmabufFileCopier(CopierInterface):
         self._fallback: Optional[CopierInterface] = None
         self._fallback_cache = fallback_cache
         self.staging_copy_bytes = 0
+        # 1 moves nothing; see "Alignment" in the module docstring.
         if align is None:
-            align = framework.get_device_ptr_align()
+            align = 1
         _check_align(align)
         self.align = align
         self.align_move_bytes = 0
@@ -651,6 +671,16 @@ class DmabufFileCopier(CopierInterface):
 
     # -- alignment ----------------------------------------------------------
 
+    def set_align(self, align: int) -> None:
+        """Set the alignment of the tensor data for the next ``wait_io``.
+
+        A caller that computes on the loaded tensors in place sets 4096, so
+        that a file whose data section is not page-aligned is moved rather
+        than used slowly; a page-aligned file moves nothing.
+        """
+        _check_align(align)
+        self.align = align
+
     def _move(self, dst: int, src: int, n: int) -> None:
         """Copy ``n`` bytes from ``src`` to ``dst``; the ranges may overlap.
 
@@ -821,7 +851,7 @@ def new_dmabuf_file_copier(
     register_bytes: Optional[int] = None
     if os.environ.get("FASTSAFETENSORS_DMABUF_REGISTER_BYTES", "").strip():
         register_bytes = _env_int("FASTSAFETENSORS_DMABUF_REGISTER_BYTES", 0)
-    # None keeps the framework's device pointer alignment.
+    # None keeps the default of 1: no move.
     align: Optional[int] = None
     if os.environ.get("FASTSAFETENSORS_DMABUF_ALIGN", "").strip():
         align = _env_int("FASTSAFETENSORS_DMABUF_ALIGN", 0)

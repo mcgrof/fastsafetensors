@@ -459,7 +459,7 @@ def misaligned_file(tmp_dir):
 
 
 @pytest.mark.parametrize("cap_kib", [None, 16])
-@pytest.mark.parametrize("align", [None, 4096])
+@pytest.mark.parametrize("align", [16, 4096])
 def test_dmabuf_aligns_tensor_data(
     framework, misaligned_file, monkeypatch, fstcpp_log, cap_kib, align
 ):
@@ -470,9 +470,8 @@ def test_dmabuf_aligns_tensor_data(
     if cap_kib is not None:
         monkeypatch.setenv("FASTSAFETENSORS_DMABUF_REGISTER_BYTES", str(cap_kib << 10))
         monkeypatch.setenv("FASTSAFETENSORS_DMABUF_IO_BYTES", str(8 * 1024))
-    if align is not None:
-        monkeypatch.setenv("FASTSAFETENSORS_DMABUF_ALIGN", str(align))
-    want = align or framework.get_device_ptr_align()
+    monkeypatch.setenv("FASTSAFETENSORS_DMABUF_ALIGN", str(align))
+    want = align
     meta = SafeTensorsMetadata.from_file(misaligned_file, framework)
     assert meta.header_length % 4096 == 280
     ref = _reference(framework, misaligned_file)
@@ -494,22 +493,71 @@ def test_dmabuf_aligns_tensor_data(
         loader.close()
 
 
-def test_dmabuf_align_one_keeps_file_offsets(
-    framework, misaligned_file, monkeypatch, fstcpp_log
+@pytest.mark.parametrize("align", [None, "1"])
+def test_dmabuf_default_keeps_file_offsets(
+    framework, misaligned_file, monkeypatch, fstcpp_log, align
 ):
-    """An alignment of 1 moves nothing: data stays at the file's offsets
-    modulo 4 KiB, as the reads placed it."""
+    """By default, and with an alignment of 1, nothing moves: data stays at
+    the file's offsets modulo 4 KiB, as the reads placed it, and every value
+    still matches the nogds reader."""
     from fastsafetensors.common import SafeTensorsMetadata
 
-    monkeypatch.setenv("FASTSAFETENSORS_DMABUF_ALIGN", "1")
+    if align is None:
+        monkeypatch.delenv("FASTSAFETENSORS_DMABUF_ALIGN", raising=False)
+    else:
+        monkeypatch.setenv("FASTSAFETENSORS_DMABUF_ALIGN", align)
     meta = SafeTensorsMetadata.from_file(misaligned_file, framework)
+    ref = _reference(framework, misaligned_file)
     loader, fb = _load_all(framework, misaligned_file)
     try:
-        ptr = fb.get_tensor("a.page").data_ptr()
-        start = meta.header_length + meta.tensors["a.page"].data_offsets[0]
-        assert ptr % 4096 == start % 4096
+        for name, expect in ref.items():
+            assert _same(framework, fb, name, expect), name
+            if expect.numel() == 0:
+                continue
+            ptr = fb.get_tensor(name).data_ptr()
+            start = meta.header_length + meta.tensors[name].data_offsets[0]
+            assert ptr % 4096 == start % 4096, name
     finally:
         fb.close()
+        loader.close()
+
+
+def test_dmabuf_set_align_moves_for_in_place_callers(
+    framework, misaligned_file, monkeypatch, fstcpp_log
+):
+    """A caller that drives the copier itself asks for 4096 with set_align;
+    the data section then starts on a page and values are unchanged."""
+    from fastsafetensors.allocation import SharedDeviceAllocation
+    from fastsafetensors.common import SafeTensorsMetadata
+
+    monkeypatch.delenv("FASTSAFETENSORS_DMABUF_ALIGN", raising=False)
+    meta = SafeTensorsMetadata.from_file(misaligned_file, framework)
+    ref = _reference(framework, misaligned_file)
+    loader = SafeTensorsFileLoader(
+        SingleGroup(), "cpu", use_dmabuf=True, framework=framework.get_name()
+    )
+    loader.add_filenames({0: [misaligned_file]})
+    copier = loader.copier_constructor(meta, loader.device, loader.framework)
+    assert copier.align == 1
+    copier.set_align(4096)
+    with pytest.raises(ValueError):
+        copier.set_align(24)
+    gbuf = copier.submit_io(True, 1 << 30)
+    owner = SharedDeviceAllocation(gbuf, loader.framework, loader.device)
+    tensors = {}
+    try:
+        tensors = copier.wait_io(gbuf, owner=owner)
+        assert copier.align_move_bytes > 0
+        for name, expect in ref.items():
+            t = tensors[name].get_raw()
+            assert t.dtype == expect.dtype and t.equal(expect), name
+            if expect.numel() == 0:
+                continue
+            off = meta.tensors[name].data_offsets[0]
+            assert t.data_ptr() % 4096 == off % 4096, name
+    finally:
+        tensors = None
+        owner.release()
         loader.close()
 
 
