@@ -32,6 +32,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import errno
+import functools
 import mmap
 import os
 import struct
@@ -494,7 +495,7 @@ def export_device_range(ptr: int, size: int, is_hip: bool) -> Tuple[int, int, in
             raise RuntimeError(f"hsa_amd_portable_export_dmabuf failed: status {rc}")
         offset = int(off.value)
     else:
-        lib = ctypes.CDLL("libcuda.so.1")
+        lib = _cuda_driver()
         fn = lib.cuMemGetHandleForAddressRange
         fn.argtypes = [
             ctypes.c_void_p,
@@ -602,36 +603,159 @@ def release_regions(
 
 
 # ---------------------------------------------------------------------------
-# Dedicated device allocations (one driver allocation per buffer)
+# Device runtime: HIP runtime on ROCm, CUDA driver API on NVIDIA
 # ---------------------------------------------------------------------------
 #
-# A caching allocator may hand out a slice of a much larger driver allocation,
-# and the ROCm exporter exports the whole allocation that contains a pointer.
-# The kernel limits the size of each registered DMA-BUF, so an arena piece
-# that must be registered needs its own driver allocation of at most the
-# copier's registration size. These helpers allocate straight from the runtime and record
-# the pointer so the framework frees it through the runtime as well.
-
-_DEDICATED: Dict[int, Tuple[int, bool]] = {}  # ptr -> (size, is_hip)
-_HIP_MEMCPY_D2D = 3
-_CUDA_MEMCPY_D2D = 3
+# On ROCm the copier calls the HIP runtime, libamdhip64.so, which resolves to
+# the library the framework already loaded.
+#
+# On NVIDIA it calls the CUDA driver API in libcuda.so.1, not the runtime.
+# Every NVIDIA driver installs libcuda.so.1 under that name, and there is
+# one driver per process. The runtime is different: pip wheels ship only
+# versioned names (libcudart.so.12, libcudart.so.13), so opening a bare
+# libcudart.so fails in a pip-only environment, and where a CUDA toolkit is
+# installed it can open a second runtime, of another version, next to the
+# framework's. The driver API works in the device's primary context, which
+# is the context the CUDA runtime, and therefore PyTorch, uses.
 
 
 def _runtime(is_hip: bool):
-    return ctypes.CDLL("libamdhip64.so" if is_hip else "libcudart.so")
+    """The HIP runtime. NVIDIA goes through ``_cuda_driver`` instead."""
+    assert is_hip, "the CUDA path uses the driver API"
+    return ctypes.CDLL("libamdhip64.so")
+
+
+_CUDA_DRIVER_LIB = "libcuda.so.1"
+# CUdevice_attribute value from cuda.h.
+CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED = 124
+
+_CUDA_SIGNATURES = {
+    "cuInit": [ctypes.c_uint],
+    "cuDeviceGet": [ctypes.POINTER(ctypes.c_int), ctypes.c_int],
+    "cuDeviceGetAttribute": [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int],
+    "cuDevicePrimaryCtxRetain": [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int],
+    "cuCtxGetCurrent": [ctypes.POINTER(ctypes.c_void_p)],
+    "cuCtxSetCurrent": [ctypes.c_void_p],
+    "cuCtxGetDevice": [ctypes.POINTER(ctypes.c_int)],
+    "cuCtxSynchronize": [],
+    "cuMemAlloc_v2": [ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t],
+    "cuMemFree_v2": [ctypes.c_uint64],
+    "cuMemcpyDtoD_v2": [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_size_t],
+}
+
+
+def _cuda_check(rc: int, what: str) -> None:
+    if rc != 0:
+        raise RuntimeError(f"{what} failed: CUresult {rc}")
+
+
+@functools.lru_cache(maxsize=None)
+def _cuda_driver() -> ctypes.CDLL:
+    """Open and initialize the CUDA driver library once per process."""
+    lib = ctypes.CDLL(_CUDA_DRIVER_LIB)
+    for name, argtypes in _CUDA_SIGNATURES.items():
+        fn = getattr(lib, name)
+        fn.argtypes = argtypes
+        fn.restype = ctypes.c_int
+    _cuda_check(lib.cuInit(0), "cuInit")
+    return lib
+
+
+@functools.lru_cache(maxsize=None)
+def _cuda_primary_context(index: int) -> int:
+    """Retain device ``index``'s primary context for the life of the process.
+
+    The CUDA runtime retains a primary context the same way once it
+    initializes a device, and never releases it before exit. Releasing it
+    here could destroy the context, and every allocation in it, when the
+    framework has not touched the device yet.
+    """
+    lib = _cuda_driver()
+    dev = ctypes.c_int(0)
+    _cuda_check(lib.cuDeviceGet(ctypes.byref(dev), index), f"cuDeviceGet({index})")
+    ctx = ctypes.c_void_p(0)
+    _cuda_check(
+        lib.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), dev),
+        f"cuDevicePrimaryCtxRetain({index})",
+    )
+    if not ctx.value:
+        raise RuntimeError(f"cuDevicePrimaryCtxRetain({index}) returned no context")
+    return int(ctx.value)
 
 
 @contextlib.contextmanager
-def device_scope(index: int, is_hip: bool) -> Iterator[None]:
+def _cuda_context(index: Optional[int]) -> Iterator[int]:
+    """Make device ``index``'s primary context current; yield the device.
+
+    With ``index`` None, keep the thread's current context, or use device
+    0's primary context when the thread has none, which is the device the
+    CUDA runtime picks for a thread that never selected one. The previous
+    context is restored on exit.
+    """
+    lib = _cuda_driver()
+    prev = ctypes.c_void_p(0)
+    _cuda_check(lib.cuCtxGetCurrent(ctypes.byref(prev)), "cuCtxGetCurrent")
+    if index is None:
+        if prev.value:
+            dev = ctypes.c_int(0)
+            _cuda_check(lib.cuCtxGetDevice(ctypes.byref(dev)), "cuCtxGetDevice")
+            yield dev.value
+            return
+        index = 0
+    target = _cuda_primary_context(index)
+    if prev.value == target:
+        yield index
+        return
+    _cuda_check(lib.cuCtxSetCurrent(target), f"cuCtxSetCurrent({index})")
+    try:
+        yield index
+    finally:
+        lib.cuCtxSetCurrent(prev)
+
+
+def cuda_dmabuf_supported(index: Optional[int]) -> bool:
+    """Whether the driver can export device ``index``'s memory as a DMA-BUF.
+
+    GeForce drivers report 0 and refuse ``cuMemGetHandleForAddressRange``
+    with ``CUDA_ERROR_NOT_SUPPORTED`` (801). Raises ``OSError`` when the
+    driver library cannot be opened and ``RuntimeError`` when a driver call
+    fails.
+    """
+    lib = _cuda_driver()
+    with _cuda_context(index) as dev_index:
+        dev = ctypes.c_int(0)
+        _cuda_check(lib.cuDeviceGet(ctypes.byref(dev), dev_index), "cuDeviceGet")
+        value = ctypes.c_int(0)
+        _cuda_check(
+            lib.cuDeviceGetAttribute(
+                ctypes.byref(value), CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED, dev
+            ),
+            "cuDeviceGetAttribute(DMA_BUF_SUPPORTED)",
+        )
+    return value.value != 0
+
+
+@contextlib.contextmanager
+def device_scope(index: Optional[int], is_hip: bool) -> Iterator[None]:
     """Make ``index`` the calling thread's current device, then restore it.
 
-    The runtime's current device is per thread and starts at 0 in a new
-    thread, such as a pipelined loader's producer. Allocation, export and
-    device copies for a load must run on the target device.
+    The current device is per thread and starts at 0 in a new thread, such
+    as a pipelined loader's producer. Allocation, export and device copies
+    for a load must run on the target device. With ``index`` None, ROCm
+    keeps the thread's current device; on NVIDIA the thread's current
+    context is kept, or device 0's primary context is made current for the
+    scope when the thread has none.
     """
+    if not is_hip:
+        with _cuda_context(index):
+            yield
+        return
+    if index is None:
+        yield
+        return
     lib = _runtime(is_hip)
-    get = lib.hipGetDevice if is_hip else lib.cudaGetDevice
-    set_ = lib.hipSetDevice if is_hip else lib.cudaSetDevice
+    get = lib.hipGetDevice
+    set_ = lib.hipSetDevice
     get.argtypes = [ctypes.POINTER(ctypes.c_int)]
     get.restype = ctypes.c_int
     set_.argtypes = [ctypes.c_int]
@@ -639,37 +763,59 @@ def device_scope(index: int, is_hip: bool) -> Iterator[None]:
     prev = ctypes.c_int(0)
     rc = get(ctypes.byref(prev))
     if rc != 0:
-        raise RuntimeError(f"{'hipGetDevice' if is_hip else 'cudaGetDevice'}: {rc}")
+        raise RuntimeError(f"hipGetDevice: {rc}")
     if prev.value == index:
         yield
         return
     rc = set_(index)
     if rc != 0:
-        raise RuntimeError(
-            f"{'hipSetDevice' if is_hip else 'cudaSetDevice'}({index}): {rc}"
-        )
+        raise RuntimeError(f"hipSetDevice({index}): {rc}")
     try:
         yield
     finally:
         set_(prev.value)
 
 
+# ---------------------------------------------------------------------------
+# Dedicated device allocations (one driver allocation per buffer)
+# ---------------------------------------------------------------------------
+#
+# A caching allocator may hand out a slice of a much larger driver allocation,
+# and the ROCm exporter exports the whole allocation that contains a pointer.
+# The kernel limits the size of each registered DMA-BUF, so an arena piece
+# that must be registered needs its own driver allocation of at most the
+# copier's registration size. These helpers allocate straight from the
+# device runtime and record the pointer so the framework frees it the same
+# way.
+
+# ptr -> (size, is_hip, CUDA device index or -1)
+_DEDICATED: Dict[int, Tuple[int, bool, int]] = {}
+_HIP_MEMCPY_D2D = 3
+
+
 def dedicated_malloc(size: int, is_hip: bool) -> int:
-    """Allocate ``size`` bytes on the current device with the runtime.
+    """Allocate ``size`` bytes on the current device.
 
     Call it inside ``device_scope`` for the target device.
     """
+    if not is_hip:
+        lib = _cuda_driver()
+        with _cuda_context(None) as dev_index:
+            dptr = ctypes.c_uint64(0)
+            rc = lib.cuMemAlloc_v2(ctypes.byref(dptr), size)
+        if rc != 0 or not dptr.value:
+            raise MemoryError(f"cuMemAlloc({size}) failed: CUresult {rc}")
+        _DEDICATED[int(dptr.value)] = (size, False, dev_index)
+        return int(dptr.value)
     lib = _runtime(is_hip)
-    fn = lib.hipMalloc if is_hip else lib.cudaMalloc
+    fn = lib.hipMalloc
     fn.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
     fn.restype = ctypes.c_int
     ptr = ctypes.c_void_p(0)
     rc = fn(ctypes.byref(ptr), size)
     if rc != 0 or not ptr.value:
-        raise MemoryError(
-            f"{'hipMalloc' if is_hip else 'cudaMalloc'}({size}) failed: {rc}"
-        )
-    _DEDICATED[int(ptr.value)] = (size, is_hip)
+        raise MemoryError(f"hipMalloc({size}) failed: {rc}")
+    _DEDICATED[int(ptr.value)] = (size, True, -1)
     return int(ptr.value)
 
 
@@ -678,23 +824,41 @@ def release_dedicated(ptr: int) -> bool:
     entry = _DEDICATED.pop(ptr, None)
     if entry is None:
         return False
-    _size, is_hip = entry
+    _size, is_hip, dev_index = entry
+    if not is_hip:
+        lib = _cuda_driver()
+        # The caller may be any thread, so free in the allocation's own
+        # context. cudaFree waits for the device first; keep that, so no
+        # queued copy still uses the memory.
+        with _cuda_context(dev_index):
+            _cuda_check(lib.cuCtxSynchronize(), "cuCtxSynchronize")
+            _cuda_check(lib.cuMemFree_v2(ptr), "cuMemFree")
+        return True
     lib = _runtime(is_hip)
-    fn = lib.hipFree if is_hip else lib.cudaFree
+    fn = lib.hipFree
     fn.argtypes = [ctypes.c_void_p]
     fn.restype = ctypes.c_int
     rc = fn(ptr)
     if rc != 0:
-        raise RuntimeError(f"{'hipFree' if is_hip else 'cudaFree'} failed: {rc}")
+        raise RuntimeError(f"hipFree failed: {rc}")
     return True
 
 
 def device_memcpy(dst: int, src: int, size: int, is_hip: bool) -> None:
-    """Synchronous device-to-device copy through the runtime."""
+    """Device-to-device copy, ordered on the legacy default stream.
+
+    As with ``cudaMemcpy``, the copy is ordered with later work on the same
+    device but the host does not wait for it.
+    """
+    if not is_hip:
+        lib = _cuda_driver()
+        with _cuda_context(None):
+            _cuda_check(lib.cuMemcpyDtoD_v2(dst, src, size), "cuMemcpyDtoD")
+        return
     lib = _runtime(is_hip)
-    fn = lib.hipMemcpy if is_hip else lib.cudaMemcpy
+    fn = lib.hipMemcpy
     fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
     fn.restype = ctypes.c_int
-    rc = fn(dst, src, size, _HIP_MEMCPY_D2D if is_hip else _CUDA_MEMCPY_D2D)
+    rc = fn(dst, src, size, _HIP_MEMCPY_D2D)
     if rc != 0:
-        raise RuntimeError(f"{'hipMemcpy' if is_hip else 'cudaMemcpy'} failed: {rc}")
+        raise RuntimeError(f"hipMemcpy failed: {rc}")

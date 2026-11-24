@@ -38,6 +38,11 @@ Requirements:
   reports ``CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED`` (data-center GPUs with the
   open kernel modules; GeForce drivers refuse the export).
 
+On NVIDIA the copier allocates, selects the device and copies through the
+CUDA driver API in ``libcuda.so.1``, which every driver installs under that
+name, so it needs no unversioned ``libcudart.so`` and cannot open a second
+CUDA runtime next to the framework's. On ROCm it calls the HIP runtime.
+
 On a CPU device the same code registers ordinary host memory, which keeps the
 submission path testable without a GPU.
 
@@ -426,8 +431,12 @@ class DmabufFileCopier(CopierInterface):
         self.framework.free_tensor_memory(gbuf, self.device)
 
     def _on_device(self) -> ContextManager[None]:
-        """Run allocation, export and device copies on the target device."""
-        if not self.is_device or self.device.index is None:
+        """Run allocation, export and device copies on the target device.
+
+        A device without an index means the thread's current device; on
+        NVIDIA the scope still makes a context current for the whole load.
+        """
+        if not self.is_device:
             return contextlib.nullcontext()
         return device_scope(self.device.index, self.is_hip)
 

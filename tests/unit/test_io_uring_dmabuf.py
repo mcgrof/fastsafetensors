@@ -53,19 +53,166 @@ class _Fn:
         return self.fn(*args)
 
 
-@pytest.mark.parametrize("is_hip", [True, False])
-def test_device_scope_selects_and_restores(monkeypatch, is_hip):
+def test_device_scope_selects_and_restores_hip(monkeypatch):
     import fastsafetensors.io_uring_dmabuf as iod
 
     fake = _FakeRuntime(current=0)
     monkeypatch.setattr(iod, "_runtime", lambda hip: fake)
-    with iod.device_scope(3, is_hip):
+    with iod.device_scope(3, True):
         assert fake.current == 3
     assert fake.current == 0 and fake.calls == [3, 0]
     fake.calls.clear()
-    with iod.device_scope(0, is_hip):
+    with iod.device_scope(0, True):
+        pass
+    with iod.device_scope(None, True):
         pass
     assert fake.calls == []
+
+
+class _FakeDriver:
+    """Models the CUDA driver calls the copier makes, for one thread.
+
+    Context handles are 0x1000 + device index; 0 means no current context.
+    """
+
+    def __init__(self, current=0, dma_buf_supported=1):
+        self.current = current
+        self.sets = []
+        self.allocs = {}
+        self.events = []
+        self.next_ptr = 0x7000_0000
+        self.dma_buf_supported = dma_buf_supported
+
+        def out(ptr, ctype, value):
+            ctypes.cast(ptr, ctypes.POINTER(ctype))[0] = value
+
+        def get_current(p):
+            out(p, ctypes.c_void_p, self.current or None)
+            return 0
+
+        def set_current(ctx):
+            ctx = ctx.value if isinstance(ctx, ctypes.c_void_p) else ctx
+            self.sets.append(ctx or 0)
+            self.current = ctx or 0
+            return 0
+
+        def get_device(p):
+            if not self.current:
+                return 201  # CUDA_ERROR_INVALID_CONTEXT
+            out(p, ctypes.c_int, self.current - 0x1000)
+            return 0
+
+        def device_get(p, index):
+            out(p, ctypes.c_int, index)
+            return 0
+
+        def attribute(p, attr, dev):
+            out(p, ctypes.c_int, self.dma_buf_supported if attr == 124 else 0)
+            return 0
+
+        def alloc(p, size):
+            if not self.current:
+                return 201
+            ptr = self.next_ptr
+            self.next_ptr += 1 << 20
+            self.allocs[ptr] = self.current
+            out(p, ctypes.c_uint64, ptr)
+            return 0
+
+        def sync():
+            self.events.append(("sync", self.current))
+            return 0
+
+        def free(ptr):
+            if self.allocs.pop(ptr, None) != self.current:
+                return 201  # freed outside its own context
+            self.events.append(("free", self.current))
+            return 0
+
+        def copy(dst, src, size):
+            if not self.current:
+                return 201
+            self.events.append(("copy", self.current))
+            return 0
+
+        self.cuCtxGetCurrent = _Fn(get_current)
+        self.cuCtxSetCurrent = _Fn(set_current)
+        self.cuCtxGetDevice = _Fn(get_device)
+        self.cuDeviceGet = _Fn(device_get)
+        self.cuDeviceGetAttribute = _Fn(attribute)
+        self.cuMemAlloc_v2 = _Fn(alloc)
+        self.cuCtxSynchronize = _Fn(sync)
+        self.cuMemFree_v2 = _Fn(free)
+        self.cuMemcpyDtoD_v2 = _Fn(copy)
+
+
+@pytest.fixture
+def fake_driver(monkeypatch):
+    import fastsafetensors.io_uring_dmabuf as iod
+
+    def install(**kwargs):
+        fake = _FakeDriver(**kwargs)
+        monkeypatch.setattr(iod, "_cuda_driver", lambda: fake)
+        monkeypatch.setattr(iod, "_cuda_primary_context", lambda i: 0x1000 + i)
+        monkeypatch.setattr(
+            iod, "_runtime", lambda hip: pytest.fail("CUDA must not load a runtime")
+        )
+        return fake
+
+    return install
+
+
+def test_device_scope_selects_and_restores_cuda(fake_driver):
+    import fastsafetensors.io_uring_dmabuf as iod
+
+    fake = fake_driver(current=0x1000)
+    with iod.device_scope(3, False):
+        assert fake.current == 0x1003
+    assert fake.current == 0x1000 and fake.sets == [0x1003, 0x1000]
+    fake.sets.clear()
+    with iod.device_scope(0, False):
+        pass
+    with iod.device_scope(None, False):
+        pass
+    assert fake.sets == []
+
+
+def test_cuda_thread_without_context_uses_device_zero(fake_driver):
+    """A new thread has no current context; the runtime would pick device 0."""
+    import fastsafetensors.io_uring_dmabuf as iod
+
+    fake = fake_driver(current=0)
+    with iod.device_scope(None, False):
+        assert fake.current == 0x1000
+    assert fake.current == 0
+    ptr = iod.dedicated_malloc(4096, False)
+    assert fake.allocs[ptr] == 0x1000 and fake.current == 0
+    iod.device_memcpy(ptr, ptr, 4096, False)
+    assert fake.events == [("copy", 0x1000)] and fake.current == 0
+    assert iod.release_dedicated(ptr)
+
+
+def test_cuda_free_runs_in_the_allocation_context(fake_driver):
+    """The framework may free from another thread or device."""
+    import fastsafetensors.io_uring_dmabuf as iod
+
+    fake = fake_driver(current=0x1000)
+    with iod.device_scope(2, False):
+        ptr = iod.dedicated_malloc(4096, False)
+    assert fake.allocs[ptr] == 0x1002
+    assert iod.release_dedicated(ptr)
+    assert fake.events == [("sync", 0x1002), ("free", 0x1002)]
+    assert fake.current == 0x1000
+    assert not iod.release_dedicated(ptr)
+
+
+@pytest.mark.parametrize("value", [0, 1])
+def test_cuda_dmabuf_supported_reads_the_attribute(fake_driver, value):
+    import fastsafetensors.io_uring_dmabuf as iod
+
+    fake_driver(current=0, dma_buf_supported=value)
+    assert iod.cuda_dmabuf_supported(1) is bool(value)
+    assert iod.cuda_dmabuf_supported(None) is bool(value)
 
 
 _UDMABUF_CREATE = (1 << 30) | (24 << 16) | (ord("u") << 8) | 0x42
