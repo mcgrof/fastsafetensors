@@ -116,6 +116,7 @@ from ..io_uring_dmabuf import (
     DMABUF_REGISTER_MAX_BYTES,
     IoUring,
     RegisteredRegion,
+    cuda_dmabuf_supported,
     dedicated_malloc,
     device_memcpy,
     device_scope,
@@ -863,6 +864,20 @@ def new_dmabuf_file_copier(
     load_library_func(framework)
     if device.type != DeviceType.CPU and not is_gpu_found():
         return fallback("GPU runtime library not found")
+    if device.type in (DeviceType.CUDA, DeviceType.GPU) and not fstcpp.is_hip_found():
+        # Ask the driver before allocating anything, so a GPU that cannot
+        # export DMA-BUFs falls back with that reason instead of an export
+        # failure on the first file.
+        try:
+            supported = cuda_dmabuf_supported(device.index)
+        except (OSError, RuntimeError) as exc:
+            return fallback(f"CUDA driver unavailable: {exc}")
+        if not supported:
+            return fallback(
+                "the NVIDIA driver reports no DMA-BUF export for this GPU "
+                "(CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED is 0; GeForce "
+                "drivers refuse the export)"
+            )
     io_bytes = _env_int("FASTSAFETENSORS_DMABUF_IO_BYTES", _DEFAULT_IO_BYTES)
     queue_depth = _env_int("FASTSAFETENSORS_DMABUF_QUEUE_DEPTH", _DEFAULT_QUEUE_DEPTH)
     # None keeps the adaptive cap (see the module docstring).

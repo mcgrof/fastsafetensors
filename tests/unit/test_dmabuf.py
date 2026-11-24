@@ -615,3 +615,62 @@ def test_dmabuf_align_rejects_bad_values(framework, monkeypatch, value):
         SafeTensorsFileLoader(
             SingleGroup(), "cpu", use_dmabuf=True, framework=framework.get_name()
         )
+
+
+@pytest.mark.parametrize("strict", [True, False])
+def test_dmabuf_gpu_without_export_support_falls_back_up_front(
+    framework, monkeypatch, strict
+):
+    """A GPU whose driver reports no DMA-BUF export never reaches the export."""
+    from fastsafetensors.st_types import Device, DeviceType
+
+    if strict:
+        monkeypatch.setenv("FASTSAFETENSORS_DMABUF_STRICT", "1")
+    else:
+        monkeypatch.delenv("FASTSAFETENSORS_DMABUF_STRICT", raising=False)
+    monkeypatch.setattr(dmabuf_mod, "load_library_func", lambda fw: None)
+    monkeypatch.setattr(dmabuf_mod, "is_gpu_found", lambda: True)
+    monkeypatch.setattr(dmabuf_mod.fstcpp, "is_hip_found", lambda: False)
+    asked = []
+
+    def unsupported(index):
+        asked.append(index)
+        return False
+
+    monkeypatch.setattr(dmabuf_mod, "cuda_dmabuf_supported", unsupported)
+    monkeypatch.setattr(
+        dmabuf_mod, "_new_ring", lambda depth: pytest.fail("ring set up")
+    )
+    sentinel = object()
+    monkeypatch.setattr(
+        dmabuf_mod, "new_nogds_file_copier", lambda *args, **kwargs: sentinel
+    )
+    device = Device(type=DeviceType.CUDA, index=1)
+    if strict:
+        with pytest.raises(RuntimeError, match="DMA_BUF_SUPPORTED is 0"):
+            dmabuf_mod.new_dmabuf_file_copier(device, framework)
+    else:
+        with pytest.warns(UserWarning, match="DMA_BUF_SUPPORTED is 0"):
+            assert dmabuf_mod.new_dmabuf_file_copier(device, framework) is sentinel
+    assert asked == [1]
+
+
+def test_dmabuf_missing_cuda_driver_falls_back(framework, monkeypatch):
+    from fastsafetensors.st_types import Device, DeviceType
+
+    monkeypatch.delenv("FASTSAFETENSORS_DMABUF_STRICT", raising=False)
+    monkeypatch.setattr(dmabuf_mod, "load_library_func", lambda fw: None)
+    monkeypatch.setattr(dmabuf_mod, "is_gpu_found", lambda: True)
+    monkeypatch.setattr(dmabuf_mod.fstcpp, "is_hip_found", lambda: False)
+
+    def no_driver(index):
+        raise OSError("libcuda.so.1: cannot open shared object file")
+
+    monkeypatch.setattr(dmabuf_mod, "cuda_dmabuf_supported", no_driver)
+    sentinel = object()
+    monkeypatch.setattr(
+        dmabuf_mod, "new_nogds_file_copier", lambda *args, **kwargs: sentinel
+    )
+    with pytest.warns(UserWarning, match="CUDA driver unavailable"):
+        out = dmabuf_mod.new_dmabuf_file_copier(Device(type=DeviceType.CUDA), framework)
+    assert out is sentinel
