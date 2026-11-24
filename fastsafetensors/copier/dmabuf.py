@@ -21,8 +21,11 @@ The io_uring DMA-BUF series queued for Linux 7.4 accepts DMA-BUFs up to
 4 GiB; early revisions of it accepted only 1 GiB. Unless ``FASTSAFETENSORS_DMABUF_REGISTER_BYTES`` sets the cap, the
 copier starts at ``DMABUF_REGISTER_LARGE_BYTES`` (4 GiB - 2 MiB), which loads
 a typical shard as one piece. If the kernel refuses a registration above
-1 GiB, the copier releases the file's pieces, retries it at 1 GiB and keeps
-that cap for the rest of the process.
+1 GiB with ``EINVAL``, the error both revisions return for an oversized
+DMA-BUF, the copier releases the file's pieces, retries it at 1 GiB and
+keeps that cap for the rest of the process. Any other refusal, such as
+``EOPNOTSUPP`` for a file whose file system has no DMA-BUF support, falls
+back to ``nogds`` for that file at once and leaves the cap alone.
 
 Requirements:
 
@@ -174,7 +177,7 @@ class _SetupRefused(Exception):
 
 
 class _RegistrationTooLarge(_SetupRefused):
-    """A registration above 1 GiB was refused; a smaller cap may work."""
+    """A registration above 1 GiB was refused with EINVAL; 1 GiB may work."""
 
 
 class _Piece:
@@ -467,8 +470,14 @@ class DmabufFileCopier(CopierInterface):
                 max_bytes=self.register_bytes,
             )
         except (OSError, RuntimeError, ValueError) as exc:
+            # The kernel refuses an oversized DMA-BUF with EINVAL. Any other
+            # failure (EOPNOTSUPP from a file without DMA-BUF support, an
+            # export the driver refuses) would fail at every size, so it
+            # must not lower the cap.
             if (
                 self.adaptive_register
+                and isinstance(exc, OSError)
+                and exc.errno == errno.EINVAL
                 and self.register_bytes > DMABUF_REGISTER_MAX_BYTES
                 and min(length, self.register_bytes) > DMABUF_REGISTER_MAX_BYTES
             ):

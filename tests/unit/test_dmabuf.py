@@ -171,6 +171,53 @@ def test_dmabuf_explicit_cap_is_not_adapted(
     assert dmabuf_mod._adaptive_register_bytes == large
 
 
+@pytest.mark.parametrize("strict", [True, False])
+def test_dmabuf_unsupported_target_keeps_large_cap(
+    framework, big_file, fstcpp_log, monkeypatch, adaptive_cap, strict
+):
+    """EOPNOTSUPP on a large registration is not a size refusal.
+
+    A file system without DMA-BUF support refuses every registration, so the
+    copier must give up on the first one, without retrying at the floor and
+    without lowering the cap for later loads.
+    """
+    import errno
+
+    floor, large, calls = adaptive_cap
+    if not strict:
+        monkeypatch.delenv("FASTSAFETENSORS_DMABUF_STRICT", raising=False)
+
+    def unsupported(ring, base, length, target_fd, is_device, is_hip, max_bytes):
+        calls.append(max_bytes)
+        raise OSError(errno.EOPNOTSUPP, "Operation not supported")
+
+    monkeypatch.setattr(dmabuf_mod, "register_destination", unsupported)
+    if strict:
+        with pytest.raises(RuntimeError, match="not supported"):
+            _load_and_compare(framework, big_file)
+    else:
+        _load_and_compare(framework, big_file)
+    assert calls == [large]
+    assert dmabuf_mod._adaptive_register_bytes == large
+
+
+def test_dmabuf_refused_export_keeps_large_cap(
+    framework, big_file, fstcpp_log, adaptive_cap, monkeypatch
+):
+    """A refused export (RuntimeError, e.g. CUresult 801) is not a size refusal."""
+    floor, large, calls = adaptive_cap
+
+    def refused(ring, base, length, target_fd, is_device, is_hip, max_bytes):
+        calls.append(max_bytes)
+        raise RuntimeError("cuMemGetHandleForAddressRange failed: CUresult 801")
+
+    monkeypatch.setattr(dmabuf_mod, "register_destination", refused)
+    with pytest.raises(RuntimeError, match="CUresult 801"):
+        _load_and_compare(framework, big_file)
+    assert calls == [large]
+    assert dmabuf_mod._adaptive_register_bytes == large
+
+
 def test_dmabuf_full_file_matches_nogds(framework, input_files, fstcpp_log):
     ref = _reference(framework, input_files[0])
     loader = SafeTensorsFileLoader(

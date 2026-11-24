@@ -291,9 +291,12 @@ class IoUring:
     def register_dmabuf(self, dmabuf_fd: int, target_fd: int) -> int:
         """Bind a DMA-BUF to ``target_fd`` in a free slot and return the slot.
 
-        The kernel builds the DMA mapping lazily on the first read, so a
-        registration that succeeds here can still fail at I/O time with
-        ``EOPNOTSUPP`` on a file system or device without DMA-BUF support.
+        The kernel sets up the DMA-BUF I/O context for ``target_fd`` here, so
+        a file system or device without DMA-BUF support refuses the
+        registration with ``EOPNOTSUPP``, and a DMA-BUF larger than the
+        kernel accepts is refused with ``EINVAL``. The DMA mapping itself is
+        built on the first read, which can still fail if the device cannot
+        map the buffer.
         """
         index = self._take_slot()
         desc = _RegbufDesc(
